@@ -1,0 +1,428 @@
+# main.tf - Complete Terraform configuration for AWS Bedrock Claude access control
+
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# Variables
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+  default     = "prod"
+}
+
+variable "organization_name" {
+  description = "Organization name for resource naming"
+  type        = string
+  default     = "mycompany"
+}
+
+# VPC Configuration
+resource "aws_vpc" "bedrock_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "${var.organization_name}-bedrock-vpc"
+    Environment = var.environment
+  }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "bedrock_igw" {
+  vpc_id = aws_vpc.bedrock_vpc.id
+
+  tags = {
+    Name = "${var.organization_name}-bedrock-igw"
+  }
+}
+
+# Public Subnets
+resource "aws_subnet" "public_subnets" {
+  count             = 2
+  vpc_id            = aws_vpc.bedrock_vpc.id
+  cidr_block        = "10.0.${count.index + 1}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "${var.organization_name}-public-subnet-${count.index + 1}"
+    Type = "Public"
+  }
+}
+
+# Private Subnets for API Gateway
+resource "aws_subnet" "private_subnets" {
+  count             = 2
+  vpc_id            = aws_vpc.bedrock_vpc.id
+  cidr_block        = "10.0.${count.index + 3}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "${var.organization_name}-private-subnet-${count.index + 1}"
+    Type = "Private"
+  }
+}
+
+# VPC Endpoint Subnets
+resource "aws_subnet" "vpc_endpoint_subnets" {
+  count             = 2
+  vpc_id            = aws_vpc.bedrock_vpc.id
+  cidr_block        = "10.0.${count.index + 5}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "${var.organization_name}-endpoint-subnet-${count.index + 1}"
+    Type = "VPCEndpoint"
+  }
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# NAT Gateways
+resource "aws_eip" "nat_eips" {
+  count  = 2
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.organization_name}-nat-eip-${count.index + 1}"
+  }
+}
+
+resource "aws_nat_gateway" "nat_gateways" {
+  count         = 2
+  allocation_id = aws_eip.nat_eips[count.index].id
+  subnet_id     = aws_subnet.public_subnets[count.index].id
+
+  tags = {
+    Name = "${var.organization_name}-nat-gateway-${count.index + 1}"
+  }
+
+  depends_on = [aws_internet_gateway.bedrock_igw]
+}
+
+# Route Tables
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.bedrock_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.bedrock_igw.id
+  }
+
+  tags = {
+    Name = "${var.organization_name}-public-rt"
+  }
+}
+
+resource "aws_route_table" "private_rt" {
+  count  = 2
+  vpc_id = aws_vpc.bedrock_vpc.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gateways[count.index].id
+  }
+
+  tags = {
+    Name = "${var.organization_name}-private-rt-${count.index + 1}"
+  }
+}
+
+# Route Table Associations
+resource "aws_route_table_association" "public_rta" {
+  count          = 2
+  subnet_id      = aws_subnet.public_subnets[count.index].id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table_association" "private_rta" {
+  count          = 2
+  subnet_id      = aws_subnet.private_subnets[count.index].id
+  route_table_id = aws_route_table.private_rt[count.index].id
+}
+
+# Security Groups
+resource "aws_security_group" "alb_sg" {
+  name_prefix = "${var.organization_name}-alb-sg"
+  vpc_id      = aws_vpc.bedrock_vpc.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.organization_name}-alb-sg"
+  }
+}
+
+resource "aws_security_group" "api_gateway_sg" {
+  name_prefix = "${var.organization_name}-api-gateway-sg"
+  vpc_id      = aws_vpc.bedrock_vpc.id
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.bedrock_vpc.cidr_block]
+  }
+
+  tags = {
+    Name = "${var.organization_name}-api-gateway-sg"
+  }
+}
+
+resource "aws_security_group" "vpc_endpoint_sg" {
+  name_prefix = "${var.organization_name}-vpc-endpoint-sg"
+  vpc_id      = aws_vpc.bedrock_vpc.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.bedrock_vpc.cidr_block]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.organization_name}-vpc-endpoint-sg"
+  }
+}
+
+# VPC Endpoints
+resource "aws_vpc_endpoint" "bedrock_endpoint" {
+  vpc_id              = aws_vpc.bedrock_vpc.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.vpc_endpoint_subnets[*].id
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+  private_dns_enabled = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:PrincipalVpc" = aws_vpc.bedrock_vpc.id
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.organization_name}-bedrock-endpoint"
+  }
+}
+
+# IAM Roles and Policies
+resource "aws_iam_role" "bedrock_developer_role" {
+  name = "${var.organization_name}-bedrock-developer-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Condition = {
+          StringEquals = {
+            "sts:ExternalId" = "bedrock-access-${var.environment}"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.organization_name}-bedrock-developer-role"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_policy" "bedrock_access_policy" {
+  name        = "${var.organization_name}-bedrock-access-policy"
+  description = "Controlled access to Bedrock Claude models"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "BedrockClaudeAccess"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = [
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*"
+        ]
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = [var.aws_region]
+          }
+          NumericLessThan = {
+            "bedrock:ModelInvocationMaxTokens" = "100000"
+          }
+          DateGreaterThan = {
+            "aws:TokenIssueTime" = "2024-01-01T00:00:00Z"
+          }
+        }
+      },
+      {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "Custom/Bedrock"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "bedrock_developer_policy_attachment" {
+  role       = aws_iam_role.bedrock_developer_role.name
+  policy_arn = aws_iam_policy.bedrock_access_policy.arn
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_proxy" {
+  name        = "${var.organization_name}-bedrock-proxy"
+  description = "Proxy API for controlled Bedrock access"
+
+  endpoint_configuration {
+    types            = ["PRIVATE"]
+    vpc_endpoint_ids = [aws_vpc_endpoint.bedrock_endpoint.id]
+  }
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = "execute-api:Invoke"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceVpc" = aws_vpc.bedrock_vpc.id
+          }
+        }
+      }
+    ]
+  })
+}
+
+# CloudWatch Log Group for API Gateway
+resource "aws_cloudwatch_log_group" "api_gateway_logs" {
+  name              = "/aws/apigateway/${aws_api_gateway_rest_api.bedrock_proxy.name}"
+  retention_in_days = 14
+}
+
+# Cost Monitoring
+resource "aws_cloudwatch_metric_alarm" "bedrock_cost_alarm" {
+  alarm_name          = "${var.organization_name}-bedrock-cost-threshold"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "EstimatedCharges"
+  namespace           = "AWS/Billing"
+  period              = "86400"
+  statistic           = "Maximum"
+  threshold           = "1000"
+  alarm_description   = "This metric monitors Bedrock costs"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+
+  dimensions = {
+    ServiceName = "Amazon Bedrock"
+    Currency    = "USD"
+  }
+}
+
+resource "aws_sns_topic" "cost_alerts" {
+  name = "${var.organization_name}-bedrock-cost-alerts"
+}
+
+# Data sources
+data "aws_caller_identity" "current" {}
+
+# Outputs
+output "vpc_id" {
+  description = "ID of the VPC"
+  value       = aws_vpc.bedrock_vpc.id
+}
+
+output "bedrock_endpoint_id" {
+  description = "ID of the Bedrock VPC endpoint"
+  value       = aws_vpc_endpoint.bedrock_endpoint.id
+}
+
+output "api_gateway_url" {
+  description = "URL of the API Gateway"
+  value       =

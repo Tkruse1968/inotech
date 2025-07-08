@@ -1,0 +1,252 @@
+# variables.tf
+variable "allowed_account_ids" {
+  description = "List of AWS account IDs allowed to access Claude through Bedrock"
+  type        = list(string)
+  default     = ["123456789012", "123456789013", "123456789014"]
+}
+
+variable "allowed_regions" {
+  description = "List of AWS regions where Bedrock access is allowed"
+  type        = list(string)
+  default     = ["us-east-1", "us-west-2"]
+}
+
+variable "department_tags" {
+  description = "List of department tags allowed to access Claude"
+  type        = list(string)
+  default     = ["Engineering", "DataScience", "Research"]
+}
+
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# IAM policy for Claude Bedrock access restrictions
+data "aws_iam_policy_document" "claude_bedrock_access" {
+  statement {
+    sid    = "AllowClaudeModelAccess"
+    effect = "Allow"
+    
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+      "bedrock:GetFoundationModel",
+      "bedrock:ListFoundationModels"
+    ]
+    
+    resources = [
+      "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-*"
+    ]
+    
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.allowed_regions
+    }
+    
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "aws:PrincipalTag/Department"
+      values   = var.department_tags
+    }
+  }
+  
+  statement {
+    sid    = "DenyOtherRegions"
+    effect = "Deny"
+    
+    actions = ["*"]
+    
+    resources = ["*"]
+    
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.allowed_regions
+    }
+  }
+  
+  statement {
+    sid    = "DenyUnauthorizedAccounts"
+    effect = "Deny"
+    
+    actions = ["bedrock:*"]
+    
+    resources = ["*"]
+    
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:userid"
+      values   = formatlist("AIDACKCEVSQ6C2EXAMPLE:%s", var.allowed_account_ids)
+    }
+  }
+}
+
+# Create the IAM policy
+resource "aws_iam_policy" "claude_bedrock_access" {
+  name        = "ClaudeBedrockRestrictedAccess"
+  description = "Restricted access policy for Claude through AWS Bedrock"
+  policy      = data.aws_iam_policy_document.claude_bedrock_access.json
+}
+
+# IAM role for Claude Bedrock access
+resource "aws_iam_role" "claude_bedrock_role" {
+  name = "ClaudeBedrockAccessRole"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = formatlist("arn:aws:iam::%s:root", var.allowed_account_ids)
+        }
+        Condition = {
+          StringEquals = {
+            "aws:RequestedRegion" = var.allowed_regions
+          }
+        }
+      }
+    ]
+  })
+  
+  tags = {
+    Purpose = "Claude Bedrock Access Control"
+  }
+}
+
+# Attach policy to role
+resource "aws_iam_role_policy_attachment" "claude_bedrock_policy_attachment" {
+  role       = aws_iam_role.claude_bedrock_role.name
+  policy_arn = aws_iam_policy.claude_bedrock_access.arn
+}
+
+# Create IAM group for Claude users
+resource "aws_iam_group" "claude_users" {
+  name = "ClaudeBedrockUsers"
+}
+
+# Attach policy to group
+resource "aws_iam_group_policy_attachment" "claude_users_policy" {
+  group      = aws_iam_group.claude_users.name
+  policy_arn = aws_iam_policy.claude_bedrock_access.arn
+}
+
+# CloudWatch Log Group for Claude access logs
+resource "aws_cloudwatch_log_group" "claude_access_logs" {
+  name              = "/aws/bedrock/claude-access"
+  retention_in_days = 30
+  
+  tags = {
+    Environment = "production"
+    Service     = "claude-bedrock"
+  }
+}
+
+# CloudTrail for auditing Claude access
+resource "aws_cloudtrail" "claude_access_trail" {
+  name                          = "claude-bedrock-access-trail"
+  s3_bucket_name               = aws_s3_bucket.claude_audit_bucket.id
+  include_global_service_events = true
+  is_multi_region_trail        = true
+  enable_logging               = true
+  
+  event_selector {
+    read_write_type                 = "All"
+    include_management_events       = true
+    
+    data_resource {
+      type   = "AWS::Bedrock::*"
+      values = ["arn:aws:bedrock:*"]
+    }
+  }
+  
+  depends_on = [aws_s3_bucket_policy.claude_audit_bucket_policy]
+}
+
+# S3 bucket for CloudTrail logs
+resource "aws_s3_bucket" "claude_audit_bucket" {
+  bucket        = "claude-bedrock-audit-${random_string.bucket_suffix.result}"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_policy" "claude_audit_bucket_policy" {
+  bucket = aws_s3_bucket.claude_audit_bucket.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSCloudTrailAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.claude_audit_bucket.arn
+      },
+      {
+        Sid    = "AWSCloudTrailWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.claude_audit_bucket.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "random_string" "bucket_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+# outputs.tf
+output "claude_bedrock_policy_arn" {
+  description = "ARN of the Claude Bedrock access policy"
+  value       = aws_iam_policy.claude_bedrock_access.arn
+}
+
+output "claude_bedrock_role_arn" {
+  description = "ARN of the Claude Bedrock access role"
+  value       = aws_iam_role.claude_bedrock_role.arn
+}
+
+output "claude_users_group_name" {
+  description = "Name of the Claude users IAM group"
+  value       = aws_iam_group.claude_users.name
+}
+
+output "allowed_accounts" {
+  description = "List of allowed AWS account IDs"
+  value       = var.allowed_account_ids
+}
+
+output "allowed_regions" {
+  description = "List of allowed AWS regions"
+  value       = var.allowed_regions
+}
+
+output "audit_bucket_name" {
+  description = "Name of the S3 bucket for audit logs"
+  value       = aws_s3_bucket.claude_audit_bucket.id
+}
